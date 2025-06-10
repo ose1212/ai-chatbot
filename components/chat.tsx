@@ -1,5 +1,7 @@
 'use client';
 
+// ALTE VERSION (auskommentiert, weil nicht Assistants API kompatibel)
+/*
 import type { Attachment, UIMessage } from 'ai';
 import { useChat } from '@ai-sdk/react';
 import { useEffect, useState } from 'react';
@@ -20,161 +22,149 @@ import { useSearchParams } from 'next/navigation';
 import { useChatVisibility } from '@/hooks/use-chat-visibility';
 import { useAutoResume } from '@/hooks/use-auto-resume';
 import { ChatSDKError } from '@/lib/errors';
+*/
 
-export function Chat({
-  id,
-  initialMessages,
-  initialChatModel,
-  initialVisibilityType,
-  isReadonly,
-  session,
-  autoResume,
-}: {
-  id: string;
-  initialMessages: Array<UIMessage>;
-  initialChatModel: string;
-  initialVisibilityType: VisibilityType;
-  isReadonly: boolean;
-  session: Session;
-  autoResume: boolean;
-}) {
-  const { mutate } = useSWRConfig();
+import React, { useState } from 'react';
 
-  const { visibilityType } = useChatVisibility({
-    chatId: id,
-    initialVisibilityType,
-  });
+export function Chat() {
+  // States
+  const [messages, setMessages] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [input, setInput] = useState('');
+  const [status, setStatus] = useState<'idle' | 'loading'>('idle');
 
-  const {
-    messages,
-    setMessages,
-    handleSubmit,
-    input,
-    setInput,
-    append,
-    status,
-    stop,
-    reload,
-    experimental_resume,
-    data,
-  } = useChat({
-    id,
-    initialMessages,
-    experimental_throttle: 100,
-    sendExtraMessageFields: true,
-    generateId: generateUUID,
-    fetch: fetchWithErrorHandlers,
-    experimental_prepareRequestBody: (body) => ({
-      id,
-      message: body.messages.at(-1),
-      selectedChatModel: initialChatModel,
-      selectedVisibilityType: visibilityType,
-    }),
-    onFinish: () => {
-      mutate(unstable_serialize(getChatHistoryPaginationKey));
-    },
-    onError: (error) => {
-      if (error instanceof ChatSDKError) {
-        toast({
-          type: 'error',
-          description: error.message,
-        });
-      }
-    },
-  });
+  // Assistants API Call
+  const runAssistant = async (userMessage: string) => {
+    const OPENAI_API_KEY = process.env.NEXT_PUBLIC_OPENAI_API_KEY as string;
+    const OPENAI_ASSISTANT_ID = process.env.NEXT_PUBLIC_OPENAI_ASSISTANT_ID as string;
 
-  const searchParams = useSearchParams();
-  const query = searchParams.get('query');
+    // 1️⃣ Create thread
+    const threadRes = await fetch('https://api.openai.com/v1/threads', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2',
+      },
+      body: JSON.stringify({}),
+    });
+    const threadData = await threadRes.json();
+    const threadId = threadData.id;
 
-  const [hasAppendedQuery, setHasAppendedQuery] = useState(false);
-
-  useEffect(() => {
-    if (query && !hasAppendedQuery) {
-      append({
+    // 2️⃣ Add message
+    await fetch(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2',
+      },
+      body: JSON.stringify({
         role: 'user',
-        content: query,
+        content: userMessage,
+      }),
+    });
+
+    // 3️⃣ Start run
+    const runRes = await fetch(`https://api.openai.com/v1/threads/${threadId}/runs`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2',
+      },
+      body: JSON.stringify({
+        assistant_id: OPENAI_ASSISTANT_ID,
+      }),
+    });
+    const runData = await runRes.json();
+    const runId = runData.id;
+
+    // 4️⃣ Poll run status
+    let runStatus = 'in_progress';
+    while (runStatus === 'in_progress' || runStatus === 'queued') {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const checkRunRes = await fetch(`https://api.openai.com/v1/threads/${threadId}/runs/${runId}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+          'OpenAI-Beta': 'assistants=v2',
+        },
       });
-
-      setHasAppendedQuery(true);
-      window.history.replaceState({}, '', `/chat/${id}`);
+      const runCheckData = await checkRunRes.json();
+      runStatus = runCheckData.status;
     }
-  }, [query, append, hasAppendedQuery, id]);
 
-  const { data: votes } = useSWR<Array<Vote>>(
-    messages.length >= 2 ? `/api/vote?chatId=${id}` : null,
-    fetcher,
-  );
+    // 5️⃣ Get messages
+    const messagesRes = await fetch(`https://api.openai.com/v1/threads/${threadId}/messages`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Beta': 'assistants=v2',
+      },
+    });
+    const messagesData = await messagesRes.json();
+    const lastMessage = messagesData.data[0].content[0].text.value;
+    return lastMessage;
+  };
 
-  const [attachments, setAttachments] = useState<Array<Attachment>>([]);
-  const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
+  // Handle Submit
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!input.trim()) return;
 
-  useAutoResume({
-    autoResume,
-    initialMessages,
-    experimental_resume,
-    data,
-    setMessages,
-  });
+    const userMessage = input.trim();
+    setMessages([...messages, { role: 'user', content: userMessage }]);
+    setInput('');
+    setStatus('loading');
 
+    try {
+      const botResponse = await runAssistant(userMessage);
+      setMessages((prevMessages) => [
+        ...prevMessages,
+        { role: 'user', content: userMessage },
+        { role: 'assistant', content: botResponse },
+      ]);
+    } catch (error) {
+      console.error('Assistant API error:', error);
+    }
+
+    setStatus('idle');
+  };
+
+  // Simple Chat UI
   return (
-    <>
-      <div className="flex flex-col min-w-0 h-dvh bg-background">
-        <ChatHeader
-          chatId={id}
-          selectedModelId={initialChatModel}
-          selectedVisibilityType={initialVisibilityType}
-          isReadonly={isReadonly}
-          session={session}
-        />
-
-        <Messages
-          chatId={id}
-          status={status}
-          votes={votes}
-          messages={messages}
-          setMessages={setMessages}
-          reload={reload}
-          isReadonly={isReadonly}
-          isArtifactVisible={isArtifactVisible}
-        />
-
-        <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
-          {!isReadonly && (
-            <MultimodalInput
-              chatId={id}
-              input={input}
-              setInput={setInput}
-              handleSubmit={handleSubmit}
-              status={status}
-              stop={stop}
-              attachments={attachments}
-              setAttachments={setAttachments}
-              messages={messages}
-              setMessages={setMessages}
-              append={append}
-              selectedVisibilityType={visibilityType}
-            />
-          )}
-        </form>
+    <div style={{ maxWidth: '600px', margin: '0 auto', padding: '1rem' }}>
+      <h1>Leadership GPT Chatbot</h1>
+      <div
+        style={{
+          border: '1px solid #ccc',
+          padding: '1rem',
+          height: '400px',
+          overflowY: 'scroll',
+          marginBottom: '1rem',
+        }}
+      >
+        {messages.map((msg, index) => (
+          <div key={index} style={{ marginBottom: '0.5rem' }}>
+            <strong>{msg.role === 'user' ? 'You:' : 'Assistant:'}</strong> {msg.content}
+          </div>
+        ))}
       </div>
-
-      <Artifact
-        chatId={id}
-        input={input}
-        setInput={setInput}
-        handleSubmit={handleSubmit}
-        status={status}
-        stop={stop}
-        attachments={attachments}
-        setAttachments={setAttachments}
-        append={append}
-        messages={messages}
-        setMessages={setMessages}
-        reload={reload}
-        votes={votes}
-        isReadonly={isReadonly}
-        selectedVisibilityType={visibilityType}
-      />
-    </>
+      <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '0.5rem' }}>
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          style={{ flex: 1, padding: '0.5rem' }}
+          placeholder="Type your message..."
+          disabled={status === 'loading'}
+        />
+        <button type="submit" disabled={status === 'loading'}>
+          Send
+        </button>
+      </form>
+    </div>
   );
 }
